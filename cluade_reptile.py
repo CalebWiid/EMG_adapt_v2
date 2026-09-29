@@ -45,8 +45,8 @@ N_WAY = 12                         # gestures per task
 K_SHOT = 5                        # support PERFORMANCES per class per task (across subjects)
 META_ITERS = 200                 # M: number of meta-iterations
 INNER_STEPS = 3                  # gradient steps on the support set per task
-INNER_LR = 1e-5                  # inner-loop Adam lr
-STEP_SIZE = 0.05                  # s: initial Reptile step size (beta = (1-m/M)*s)
+INNER_LR = 1e-4                  # inner-loop Adam lr
+STEP_SIZE = 0.1                  # s: initial Reptile step size (beta = (1-m/M)*s)
 LAMBDA = 0.25                    # prototype-loss weight for META-training (the meta setting)
 FREEZE_FEATURES = True
 
@@ -429,5 +429,190 @@ def run(subjects=SUBJECTS, exercises=EXERCISES, n_novel=N_NOVEL, n_way=N_WAY, k_
     return model, result
  
  
+
+
+# --------------------------------------------------------------------------- #
+# Cross-user (leave-N-subjects-out) evaluation harness
+# --------------------------------------------------------------------------- #
+def subject_folds(subjects, n_holdout=2):
+    """Yield (train_subjects, held_out_subjects) folds so each subject is held out once."""
+    subs = list(subjects)
+    for i in range(0, len(subs), n_holdout):
+        held = subs[i:i + n_holdout]
+        train = [s for s in subs if s not in held]
+        yield train, held
+
+
+@torch.no_grad()
+def evaluate_crossuser(model, X, y, reps, subj, novel_classes, held_subjects,
+                       enroll_reps, test_reps, device):
+    """PER-USER enrollment on held-out subjects: for each held-out subject, enroll
+    their novel gestures from THEIR enroll reps and test on THEIR test reps (the model
+    has never seen this subject). Returns per-subject accuracies + the mean over them."""
+    per = {}
+    for s in held_subjects:
+        sm = subj == s
+        Xs, ys, rs = X[sm], y[sm], reps[sm]
+        emask = np.isin(rs, enroll_reps) & np.isin(ys, novel_classes)
+        protos = class_prototypes(embed_all(model, Xs[emask], device), ys[emask], novel_classes).to(device)
+        tmask = np.isin(rs, test_reps) & np.isin(ys, novel_classes)
+        Xq, yq, rq = Xs[tmask], ys[tmask], rs[tmask]
+        embs = embed_all(model, Xq, device)
+        preds = np.asarray(novel_classes)[torch.cdist(embs, protos.cpu()).argmin(1).numpy()]
+        win = float((preds == yq).mean())
+        pooled, _ = majority_pooled(preds, yq, np.full(len(yq), s), rq)
+        per[int(s)] = {"window_acc": win, "pooled_acc": pooled}
+    return {"per_subject": per,
+            "mean_window": float(np.mean([v["window_acc"] for v in per.values()])),
+            "mean_pooled": float(np.mean([v["pooled_acc"] for v in per.values()]))}
+
+
+def run_crossval(subjects=SUBJECTS, exercises=EXERCISES, n_holdout=2, n_novel=N_NOVEL,
+                 n_way=N_WAY, k_shot=K_SHOT, meta_iters=META_ITERS, inner_steps=INNER_STEPS,
+                 inner_lr=INNER_LR, step_size=STEP_SIZE, lambda_=LAMBDA,
+                 enroll_reps=ENROLL_REPS, test_reps=TEST_REPS, eval_every=EVAL_EVERY,
+                 pretrain_epochs=PRETRAIN_EPOCHS, pretrain_lr=PRETRAIN_LR,
+                 pretrain_lambda=PRETRAIN_LAMBDA, freeze_features=FREEZE_FEATURES, seed=0):
+    """Leave-N-subjects-out cross-validation comparing SUPERVISED vs REPTILE on
+    genuinely unseen users. For each fold: pre-train the embedding on the TRAINING
+    subjects' base gestures, evaluate it on the HELD-OUT subjects (= supervised),
+    then meta-train and evaluate again on the SAME held-out subjects (= reptile).
+    Both numbers come from one run on identical data, so the only difference is meta."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"device: {device}")
+    torch.manual_seed(seed)
+    assert len(set(enroll_reps) & set(test_reps)) == 0
+
+    X, y, reps, subj = load_subject_gestures(subjects, exercises)
+    base_classes, novel_classes = split_base_novel(y, n_novel=n_novel, seed=seed)
+    assert set(base_classes).isdisjoint(novel_classes)
+    e = X.shape[1]
+
+    fold_rows = []
+    for fold_i, (train_subs, held_subs) in enumerate(subject_folds(subjects, n_holdout), 1):
+        assert set(train_subs).isdisjoint(held_subs)
+        print(f"\n=== Fold {fold_i}: train {train_subs} | held-out {held_subs} ===")
+
+        # training data = TRAINING subjects only (held-out subjects never seen)
+        trm = np.isin(subj, train_subs)
+        Xtr, ytr, reps_tr, subj_tr = X[trm], y[trm], reps[trm], subj[trm]
+        assert set(np.unique(subj_tr)).isdisjoint(held_subs)   # guardrail: no leakage
+
+        # ---- Phase 1: pre-train the embedding on TRAINING subjects' base gestures ----
+        pre_path = f"pretrained_fold{fold_i}_seed{seed}.pt"
+        if os.path.exists(pre_path):
+            pretrained = EMGAdapt(e=e, n_classes=len(base_classes))
+            pretrained.load_state_dict(torch.load(pre_path, map_location=device))
+            pretrained.to(device)
+            print(f"  loaded fold embedding <- {pre_path}")
+        else:
+            print(f"  pre-training embedding on {len(train_subs)} subjects (lambda={pretrain_lambda}) ...")
+            Xb, yb = make_base_dataset(Xtr, ytr, base_classes)
+            pretrained = pretrain_embedding(Xb, yb, len(base_classes), e, pretrain_epochs,
+                                            pretrain_lr, pretrain_lambda, 256, device)
+            torch.save(pretrained.state_dict(), pre_path)
+            print(f"  saved fold embedding -> {pre_path}")
+
+        # ---- SUPERVISED: evaluate the pretrained embedding on the held-out subjects ----
+        sup = evaluate_crossuser(pretrained, X, y, reps, subj, novel_classes,
+                                 held_subs, enroll_reps, test_reps, device)
+        print(f"  [supervised] held-out pooled {sup['mean_pooled']:.4f}  window {sup['mean_window']:.4f}")
+
+        # ---- Phase 2: meta-train from that embedding (tasks from TRAIN subjects only) ----
+        model = EMGAdapt(e=e, n_classes=n_way).to(device)
+        model.features.load_state_dict(pretrained.features.state_dict())
+        model.embedding.load_state_dict(pretrained.embedding.state_dict())
+        if freeze_features:
+            for p_ in model.features.parameters():
+                p_.requires_grad_(False)
+        bm = np.isin(ytr, base_classes)
+        sampler = TaskSampler(Xtr[bm], ytr[bm], reps_tr[bm], subj_tr[bm],
+                              base_classes, n_way, k_shot, seed=seed)
+
+        def eval_fn(mdl):
+            r = evaluate_crossuser(mdl, X, y, reps, subj, novel_classes,
+                                   held_subs, enroll_reps, test_reps, device)
+            return {"window_acc": r["mean_window"], "pooled_acc": r["mean_pooled"]}
+
+        model, _ = reptile_train(model, sampler, eval_fn, meta_iters=meta_iters,
+                                 inner_steps=inner_steps, inner_lr=inner_lr, step_size=step_size,
+                                 n_way=n_way, lambda_=lambda_, eval_every=eval_every,
+                                 freeze_features=freeze_features, device=device)
+
+        # ---- REPTILE: evaluate the meta-trained model on the SAME held-out subjects ----
+        rep = evaluate_crossuser(model, X, y, reps, subj, novel_classes,
+                                 held_subs, enroll_reps, test_reps, device)
+        print(f"  [reptile]    held-out pooled {rep['mean_pooled']:.4f}  window {rep['mean_window']:.4f}")
+
+        fold_rows.append({"fold": fold_i, "held_out": "-".join(map(str, held_subs)),
+                          "supervised_pooled": round(sup["mean_pooled"], 6),
+                          "reptile_pooled": round(rep["mean_pooled"], 6),
+                          "supervised_window": round(sup["mean_window"], 6),
+                          "reptile_window": round(rep["mean_window"], 6),
+                          "delta_pooled": round(rep["mean_pooled"] - sup["mean_pooled"], 6)})
+
+    # ---- average across folds ----
+    def col(k): return float(np.mean([r[k] for r in fold_rows]))
+    avg = {"fold": "AVERAGE", "held_out": "all",
+           "supervised_pooled": round(col("supervised_pooled"), 6),
+           "reptile_pooled": round(col("reptile_pooled"), 6),
+           "supervised_window": round(col("supervised_window"), 6),
+           "reptile_window": round(col("reptile_window"), 6),
+           "delta_pooled": round(col("delta_pooled"), 6)}
+    fold_rows.append(avg)
+
+    print("\n===== CROSS-USER SUMMARY (mean over folds) =====")
+    print(f"  supervised pooled : {avg['supervised_pooled']:.4f}")
+    print(f"  reptile    pooled : {avg['reptile_pooled']:.4f}")
+    print(f"  delta (reptile - supervised) : {avg['delta_pooled']:+.4f}")
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    config = {"experiment": "crossuser_cv", "n_holdout": n_holdout, "lambda": lambda_,
+              "inner_lr": inner_lr, "step_size": step_size, "inner_steps": inner_steps,
+              "n_way": n_way, "k_shot": k_shot, "freeze_features": freeze_features, "seed": seed}
+    save_rows(fold_rows, f"results_crossuser_cv_{stamp}.csv", config)
+    print(f"saved cross-user CV results -> results_crossuser_cv_{stamp}.csv")
+    return fold_rows
+
+#-----------------varies the seed numebr-----------------# 
+
+def seed_sweep(seeds=(0, 1, 2, 3)):
+    """Run the cross-user CV for several seeds (different novel-gesture sets) and
+    summarise supervised vs reptile. Each seed re-draws which 12 gestures are novel."""
+    summary = []
+    for sd in seeds:
+        print(f"\n########## SEED {sd} ##########")
+        fold_rows = run_crossval(seed=sd)
+        avg = fold_rows[-1]                      # the AVERAGE row of that seed's CV
+        summary.append({
+            "seed": sd,
+            "supervised_pooled": avg["supervised_pooled"],
+            "reptile_pooled": avg["reptile_pooled"],
+            "delta_pooled": avg["delta_pooled"],
+        })
+
+    import numpy as np
+    def stat(k):
+        vals = [s[k] for s in summary]
+        return float(np.mean(vals)), float(np.std(vals))
+
+    print("\n===== MULTI-SEED SUMMARY =====")
+    print(f"{'seed':>4}  {'supervised':>10}  {'reptile':>10}  {'delta':>8}")
+    for s in summary:
+        print(f"{s['seed']:>4}  {s['supervised_pooled']:>10.4f}  "
+              f"{s['reptile_pooled']:>10.4f}  {s['delta_pooled']:>+8.4f}")
+    sup_m, sup_s = stat("supervised_pooled")
+    rep_m, rep_s = stat("reptile_pooled")
+    dl_m, dl_s = stat("delta_pooled")
+    print(f"mean  {sup_m:>10.4f}  {rep_m:>10.4f}  {dl_m:>+8.4f}")
+    print(f" std  {sup_s:>10.4f}  {rep_s:>10.4f}  {dl_s:>8.4f}")
+
+    from datetime import datetime
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_rows(summary, f"results_seed_sweep_{stamp}.csv",
+              {"experiment": "crossuser_seed_sweep"})
+    print(f"saved seed sweep -> results_seed_sweep_{stamp}.csv")
+    return summary
+
 if __name__ == "__main__":
-    run()
+    seed_sweep(seeds=(0, 1, 2, 3))
