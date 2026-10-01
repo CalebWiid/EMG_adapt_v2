@@ -35,6 +35,9 @@ LOG_EPS = 1e-10             #Prevents log(0)
 # count (so the 8-channel MindRove case is left untouched).
 PHYSICAL_CHANNEL_ORDER = [1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15, 8, 16]
 
+# To mimic the Mindroves 8 channel layout, revome the second myo band 
+SELECT_CHANNELS = [1, 2, 3, 4, 5, 6, 7, 8]  
+
 DEFAULT_FILTER_KWARGS = dict(
     lowpass_cutoff=1.0,
     lowpass_order=1, 
@@ -57,7 +60,7 @@ class GestureSegment:
     emg: np.ndarray
 
 #----------------------Load Data---------------------- #
-def load_data(path: str, channel_order: Optional[list] = PHYSICAL_CHANNEL_ORDER):
+def load_data(path: str, channel_order: Optional[list] = PHYSICAL_CHANNEL_ORDER, select_channels: Optional[list] = SELECT_CHANNELS):
     """Load data from the DB5 dataset.
     
         returns 
@@ -74,6 +77,9 @@ def load_data(path: str, channel_order: Optional[list] = PHYSICAL_CHANNEL_ORDER)
 
     if emg.ndim != 2:
         raise ValueError(f"expected emg to be 2-D (samples, channels), got {emg.shape}")
+
+    if select_channels is not None and emg.shape[1] >= len(select_channels):
+        emg = emg[:, [c-1 for c in select_channels]]
 
     # Reorder channels only if the order matches the channel count (1-based -> 0-based).
     if channel_order is not None and len(channel_order) == emg.shape[1]:
